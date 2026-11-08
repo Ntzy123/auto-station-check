@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-station-check"
+version = "1.0.0"
+description = "基于 Edge WebDriver 的岗位检查自动化工具（7x24h 不间断运行）"
+license = { text = "MIT" }
+authors = [{ name = "auto-station-check" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "selenium>=4.15.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller"]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+auto-station-check = "auto_station_check.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+norecursedirs = [
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+]

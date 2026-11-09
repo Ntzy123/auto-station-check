@@ -2,6 +2,9 @@
 
 import sys
 import os
+import base64
+import json
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from unittest.mock import patch, MagicMock
@@ -11,6 +14,12 @@ from selenium.common.exceptions import TimeoutException
 
 import auto_station_check.core
 from auto_station_check.core import StationCheckAutomation
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cache(tmp_path, monkeypatch):
+    """把 token 缓存指向临时文件，避免读写项目根目录的 cache"""
+    monkeypatch.setattr(auto_station_check.core, "CACHE_FILE", str(tmp_path / "cache"))
 
 
 class TestBasics:
@@ -164,6 +173,97 @@ class TestGetAccessToken:
 
         assert token == "jwt-abc"
         assert post.call_count == 2
+
+
+def _fake_jwt(exp):
+    """造一个 payload 带 exp 的假 JWT"""
+
+    def seg(obj):
+        raw = base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+        return raw.rstrip("=")
+
+    return f"{seg({'alg': 'none'})}.{seg({'exp': exp})}.sig"
+
+
+class TestTokenCache:
+    """token 本地缓存：有效则复用，临近过期才重新获取"""
+
+    def _write(self, data):
+        with open(auto_station_check.core.CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def _read(self):
+        with open(auto_station_check.core.CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_valid_cache_skips_api(self):
+        self._write(
+            {"access_token": "jwt-cached", "expires_at": time.time() + 7 * 86400, "mobile": "m"}
+        )
+        with patch(
+            "auto_station_check.core.requests.post", side_effect=AssertionError("不该调接口")
+        ) as post:
+            assert auto_station_check.core.get_access_token("m", "p") == "jwt-cached"
+        post.assert_not_called()
+
+    def test_near_expiry_refetches_and_rewrites_cache(self):
+        exp = int(time.time()) + 7 * 86400
+        self._write(
+            {"access_token": "jwt-old", "expires_at": time.time() + 60, "mobile": "m"}
+        )
+        resp = MagicMock()
+        resp.json.return_value = {"access_token": _fake_jwt(exp)}
+        with patch("auto_station_check.core.requests.post", return_value=resp):
+            assert auto_station_check.core.get_access_token("m", "p") == _fake_jwt(exp)
+
+        data = self._read()
+        assert data["access_token"] == _fake_jwt(exp)
+        assert data["expires_at"] == exp
+        assert data["obtained_at"] <= int(time.time())
+
+    def test_other_account_cache_ignored(self):
+        self._write(
+            {"access_token": "jwt-other", "expires_at": time.time() + 7 * 86400, "mobile": "x"}
+        )
+        resp = MagicMock()
+        resp.json.return_value = {"access_token": _fake_jwt(int(time.time()) + 7 * 86400)}
+        with patch("auto_station_check.core.requests.post", return_value=resp):
+            assert auto_station_check.core.get_access_token("m", "p") != "jwt-other"
+
+    def test_non_jwt_falls_back_to_one_day(self):
+        assert auto_station_check.core._jwt_exp("not-a-jwt") is None
+        resp = MagicMock()
+        resp.json.return_value = {"access_token": "opaque-token"}
+        before = int(time.time())
+        with patch("auto_station_check.core.requests.post", return_value=resp):
+            auto_station_check.core.get_access_token("m", "p")
+
+        expires_at = self._read()["expires_at"]
+        assert before + auto_station_check.core.DEFAULT_TTL <= expires_at <= before + auto_station_check.core.DEFAULT_TTL + 5
+
+
+class TestRefreshToken:
+    """运行时 token 续期：变化才更新 cookie"""
+
+    def test_new_token_updates_cookie(self):
+        automation = StationCheckAutomation()
+        automation.driver = MagicMock()
+        automation._token = "old"
+        with patch("auto_station_check.core.get_access_token", return_value="new"):
+            automation._refresh_token()
+
+        automation.driver.add_cookie.assert_called_once_with(
+            {"name": "access_token_easycheck", "value": "new", "path": "/"}
+        )
+
+    def test_same_token_no_cookie_write(self):
+        automation = StationCheckAutomation()
+        automation.driver = MagicMock()
+        automation._token = "same"
+        with patch("auto_station_check.core.get_access_token", return_value="same"):
+            automation._refresh_token()
+
+        automation.driver.add_cookie.assert_not_called()
 
 
 class TestRunCycle:

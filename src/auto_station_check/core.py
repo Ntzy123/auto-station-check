@@ -1,5 +1,7 @@
 # core.py - 岗位检查自动化核心逻辑
 
+import base64
+import json
 import logging
 import os
 import time
@@ -35,15 +37,64 @@ PASSWORD = "H@ml000711"
 REASON = "处理其他工作来不及答题"
 TOKEN_API = "https://aec.kyrian.asia/api/get-access-token"
 
+# token 本地缓存（相对运行目录，与 log/ 同级）
+CACHE_FILE = "cache"
+# token 剩余有效期不足该秒数时重新获取（JWT 实测有效期 7 天）
+REFRESH_AHEAD = 3600
+# token 不是 JWT / 解不出 exp 时的兜底有效期
+DEFAULT_TTL = 86400
+
 # 单轮最多处理条数，防止页面异常时死循环
 MAX_ITEMS_PER_CYCLE = 20
 
 
+def _jwt_exp(token):
+    """从 JWT payload 里取 exp（秒级时间戳），解不出返回 None。"""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return int(exp) if exp else None
+    except Exception:
+        return None
+
+
+def _read_cache(mobile):
+    """读本地缓存，返回仍可用的 token；缺失/损坏/临近过期/账号不符返回 None。"""
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        token = data.get("access_token")
+        expires_at = int(data.get("expires_at") or 0)
+        if data.get("mobile") == mobile and token and expires_at - time.time() > REFRESH_AHEAD:
+            return token
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _write_cache(token, mobile):
+    """把 token 与获取/过期时间写入本地缓存。"""
+    now = int(time.time())
+    data = {
+        "access_token": token,
+        "obtained_at": now,
+        "expires_at": _jwt_exp(token) or (now + DEFAULT_TTL),
+        "mobile": mobile,
+    }
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
 def get_access_token(mobile, password, retries=3, interval=3):
-    """调用接口换取 easycheck access_token_easycheck（JWT）。
+    """取 easycheck access_token_easycheck（JWT）：优先本地缓存，过期或临近过期才调接口。
 
     接口偶发 500（服务端上游 OAuth 步骤失败），重试几次即可。
     """
+    cached = _read_cache(mobile)
+    if cached:
+        return cached
+
     err = ""
     for attempt in range(1, retries + 1):
         try:
@@ -52,6 +103,7 @@ def get_access_token(mobile, password, retries=3, interval=3):
             )
             token = (resp.json() or {}).get("access_token")
             if token:
+                _write_cache(token, mobile)
                 return token
             err = f"HTTP {resp.status_code} {resp.text[:200]}"
         except requests.RequestException as e:
@@ -175,6 +227,7 @@ class StationCheckAutomation:
         self.driver = None
         self._log = _get_logger()
         self.reason = REASON
+        self._token = None
 
     def _create_driver(self):
         options = Options()
@@ -228,14 +281,27 @@ class StationCheckAutomation:
         return True
 
     def _inject_token(self):
-        """调用接口换取 token，写入 cookie access_token_easycheck"""
+        """取 token（优先本地缓存），写入 cookie access_token_easycheck"""
         token = get_access_token(MOBILE, PASSWORD)
+        self._token = token
         self.driver.get(BASE_URL)
         time.sleep(1)
         self.driver.add_cookie(
             {"name": "access_token_easycheck", "value": token, "path": "/"}
         )
         self._log.info("  已注入 access_token_easycheck")
+
+    def _refresh_token(self):
+        """每分钟调用一次：缓存里的 token 临近过期就换新，并更新浏览器 cookie。"""
+        token = get_access_token(MOBILE, PASSWORD)
+        if token == self._token:
+            return
+        self._token = token
+        if self.driver is not None:
+            self.driver.add_cookie(
+                {"name": "access_token_easycheck", "value": token, "path": "/"}
+            )
+            self._log.info("  token 已续期，cookie 已更新")
 
     # -- 流程步骤 ---------------------------------------------------------
 
@@ -346,6 +412,8 @@ class StationCheckAutomation:
                 if self.driver is None:
                     self._create_driver()
                     self._inject_token()
+                else:
+                    self._refresh_token()
                 self.run_cycle()
             except WebDriverException as e:
                 print("  [主循环] WebDriver异常，正在重新创建驱动...")

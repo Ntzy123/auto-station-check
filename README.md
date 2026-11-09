@@ -30,6 +30,17 @@ TOKEN_API = "https://aec.kyrian.asia/api/get-access-token"
 
 启动（及每次重建驱动）时 `POST TOKEN_API`，body `{"mobile","password"}`，取响应里的 `access_token` 写入 cookie `access_token_easycheck`，无需手动维护 JWT。
 
+token 会缓存到运行目录下的 `cache` 文件（JSON）：
+
+```json
+{"access_token": "...", "obtained_at": 1794224847, "expires_at": 1794829649, "mobile": "..."}
+```
+
+- 启动时优先读 `cache`，未临近过期就直接复用，不打接口；
+- 运行中每分钟检查一次，剩余有效期不足 `REFRESH_AHEAD`（默认 1 小时）就重新获取并更新 cookie；
+- `expires_at` 取自 JWT 的 `exp`（实测有效期 **7 天**）；token 不是 JWT 时按获取时间 + 1 天兜底；
+- 文件损坏、账号不匹配时自动忽略并重新获取。
+
 ## 快速开始
 
 ```bash
